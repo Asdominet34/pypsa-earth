@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
     eo.save_osm_data(
         primary_name="power",
-        region_list=country_list,
+        region_list=['AO', 'BW', 'CD', 'LS', 'MW', 'MZ', 'namibia', 'SZ', 'TZ', 'ZA', 'ZM', 'ZW'],
         feature_list=["substation", "line", "cable", "generator"],
         update=False,
         mp=True,

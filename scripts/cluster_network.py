@@ -660,7 +660,15 @@ if __name__ == "__main__":
     inputs, outputs, config = snakemake.input, snakemake.output, snakemake.config
 
     n = pypsa.Network(inputs.network)
+  
+    #Fulmicotone gadm lv 0 cluster 24 
+    if "country" in n.lines.columns:
+      # Modifica il valore di 'country' per gli indici 
+      n.lines.loc[["3087", "3088", "3089"], "country"] = "ZM"
+      n.lines.loc[["389", "1987"], "country"] = "ZA"
+      print("Il valore di 'country' è stato aggiornato per le linee 3087 3088 3089 389 1987.")
 
+    
     alternative_clustering = snakemake.params.cluster_options["alternative_clustering"]
     distribution_cluster = snakemake.params.cluster_options["distribute_cluster"]
     gadm_layer_id = snakemake.params.build_shape_options["gadm_layer_id"]

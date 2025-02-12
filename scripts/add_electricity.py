@@ -265,7 +265,20 @@ def attach_load(n, demand_profiles):
         Now attached with load time series
     """
     demand_df = read_csv_nafix(demand_profiles, index_col=0, parse_dates=True)
-
+    
+    # Stampa i dati delle colonne per controllo
+    print("Demand DataFrame columns:")
+    print(demand_df.columns)
+    # Modifica per il paese LS
+    if '148' in demand_df.columns:
+        demand_df = demand_df.rename(columns={'148': '1276'})
+        print("Bus renamed for country LS")
+    if '256' in demand_df.columns:
+        demand_df = demand_df.rename(columns={'256': '1550'})
+        print("Bus renamed for country ZA")
+    
+    print(demand_df.columns)
+   
     n.madd("Load", demand_df.columns, bus=demand_df.columns, p_set=demand_df)
 
 
@@ -462,6 +475,115 @@ def attach_conventional_generators(
                 n.generators.loc[idx, attr] = values
 
 
+def process_hydropower_data(excel_path, hydro, sheet_name):
+    """
+    Processa i dati del file Excel e li combina con il DataFrame 'hydro'.
+    #fulmicotone
+
+    """
+    
+    # Legge il file Excel dal foglio specifico senza intestazione per debug
+    excel_data = pd.read_excel(excel_path, sheet_name=sheet_name, header=0)
+    
+    # Normalizza i nomi delle colonne
+    excel_data.columns = excel_data.columns.str.lower()
+    hydro.columns = hydro.columns.str.lower()
+
+    # Verifica se 'name' esiste
+    if 'name' not in excel_data.columns:
+        raise KeyError(f"La colonna 'name' non è presente nei dati Excel. Colonne trovate: {list(excel_data.columns)}")
+
+    # Filtra le righe con lo stesso 'name'
+    filtered_excel = excel_data[excel_data['name'].isin(hydro['name'])]
+    
+    print("Nomi presenti in 'hydro' ma mancanti in Excel:")
+    missing_names = hydro['name'][~hydro['name'].isin(excel_data['name'])]
+    print(missing_names)
+
+    # Reindicizza filtered_excel per mantenere lo stesso ordine di hydro
+    hydro_index = hydro.set_index('name').index
+    print("Indici di Hydro:", hydro_index)
+
+    filtered_excel = filtered_excel.set_index('name')
+    print("Indici di Filtered Excel prima del reindex:", filtered_excel.index)
+
+    filtered_excel = filtered_excel.reindex(hydro_index)
+    print("Filtered Excel dopo il reindex:")
+    print(filtered_excel.head())
+
+    # Filtra le colonne del file Excel che non contengono "wet" o "dry"
+    excel_columns_to_keep = [
+        col for col in filtered_excel.columns 
+        if 'wet' not in col.lower() and 'dry' not in col.lower()
+    ]
+
+    # Mantieni solo le colonne desiderate e rimuovi le colonne di hydro
+    final_data = filtered_excel[excel_columns_to_keep]
+    
+    return final_data
+
+def create_time_series(final_data, hydro):
+    """
+    Crea una serie temporale di 8760 valori per ogni riga di final_data basata
+    sui fattori di capacità mensili.
+    
+    Args:
+        final_data (pd.DataFrame): DataFrame con le colonne `*_capacity_factor_normal`
+                                   per i 12 mesi.
+    
+    Returns:
+        pd.DataFrame: DataFrame con una serie temporale di 8760 valori per ogni riga di final_data.
+    
+    #fulmicotone
+    """
+    # Ordina final_data nello stesso ordine di hydro.index
+    #final_data = final_data.loc[hydro.index]
+    
+    # Giorni per mese in un anno normale
+    days_in_month = {
+        "January": 31,
+        "February": 28,
+        "March": 31,
+        "April": 30,
+        "May": 31,
+        "June": 30,
+        "July": 31,
+        "August": 31,
+        "September": 30,
+        "October": 31,
+        "November": 30,
+        "December": 31
+    }
+
+    # Colonne dei fattori di capacità mensili in final_data
+    monthly_columns = [f"{month.lower()}_capacity_factor_normal" for month in days_in_month.keys()]
+
+    # Controlla che tutte le colonne esistano in final_data
+    missing_columns = [col for col in monthly_columns if col not in final_data.columns]
+    if missing_columns:
+        raise ValueError(f"Le seguenti colonne mancano in final_data: {missing_columns}")
+
+    # Crea la serie temporale
+    time_series_data = []
+    for _, row in final_data.iterrows():
+        row_series = []
+        for month, days in days_in_month.items():
+            col_name = f"{month.lower()}_capacity_factor_normal"
+            value = row[col_name]
+            # Ripeti il valore per il numero di ore nel mese
+            row_series.extend([value] * (days * 24))
+        time_series_data.append(row_series)
+
+    # Crea un DataFrame con le serie temporali
+    time_series_array = np.array(time_series_data)  # Forma: (n_bus, 8760)
+    time_index = pd.date_range(start="2013-01-01", periods=8760, freq="H")
+    p_max_pu_df = pd.DataFrame(
+    data=time_series_array.T,  # Array bidimensionale: una riga per ogni bus
+    columns=hydro.index,  # Nome dei bus dall'indice di hydro
+    index=time_index  # Indice temporale
+ )
+    return p_max_pu_df
+
 def attach_hydro(n, costs, ppl):
     if "hydro" not in snakemake.params.renewable:
         return
@@ -534,6 +656,7 @@ def attach_hydro(n, costs, ppl):
                 hydro_inflow_factor = hydro["p_nom"] / hydro.groupby("bus")[
                     "p_nom"
                 ].transform("sum")
+                print(hydro_inflow_factor) #fulmicotone
 
                 inflow_t = (
                     inflow.sel(plant=plants_to_keep)
@@ -544,7 +667,26 @@ def attach_hydro(n, costs, ppl):
                     * hydro_inflow_factor
                 )
 
+    #fulmicotone            
+    excel_path = r"C:\Users\Davide\pypsa-earth-project\pypsa-earth\data\African_Hydropower_Atlas_v2-0_PoliTechM.xlsx" 
+    sheet_name = "4b - HydrofleetAll SSP1-RCP26"
+    result_ror = process_hydropower_data(excel_path, ror, sheet_name)
+    # Mostra il risultato
+    print(result_ror)
+    p_max_pu_ror = create_time_series(result_ror, ror)
+    print(p_max_pu_ror.shape)  # (numero_di_righe_di_final_data, 8760)
+    print(p_max_pu_ror.head())  # Anteprima dei dati
+
     if "ror" in carriers and not ror.empty:
+        #fulmicotone
+        p_max_pu=(inflow_t[ror.index].divide(ror["p_nom"], axis=1).where(lambda df: df <= 1.0, other=1.0))
+        print(p_max_pu.head())
+        # Sostituisci i NaN di p_max_pu_ror con i valori corrispondenti di p_max_pu
+        p_max_pu_ror_filled = p_max_pu_ror.fillna(p_max_pu)
+        # Stampa il risultato per verificare
+        print("print finale ror:")
+        print(p_max_pu_ror_filled.head())
+        
         n.madd(
             "Generator",
             ror.index,
@@ -554,11 +696,7 @@ def attach_hydro(n, costs, ppl):
             efficiency=costs.at["ror", "efficiency"],
             capital_cost=costs.at["ror", "capital_cost"],
             weight=ror["p_nom"],
-            p_max_pu=(
-                inflow_t[ror.index]
-                .divide(ror["p_nom"], axis=1)
-                .where(lambda df: df <= 1.0, other=1.0)
-            ),
+            p_max_pu = p_max_pu_ror_filled #fulmicotone
         )
 
     if "PHS" in carriers and not phs.empty:
@@ -620,6 +758,16 @@ def attach_hydro(n, costs, ppl):
         hydro_max_hours = hydro.max_hours.where(
             hydro.max_hours > 0, hydro.country.map(max_hours_country)
         ).fillna(hydro_max_hours_default)
+        
+        #fulmicotone
+        result = process_hydropower_data(excel_path, hydro, sheet_name)
+        # Mostra il risultato
+        print(result)
+        p_max_pu_df = create_time_series(result, hydro)
+        print(p_max_pu_df.head())  # Anteprima dei dati
+        p_max_pu_df_filled = p_max_pu_df.fillna(1)
+        print("Print finale hydro:")
+        print(p_max_pu_df_filled.head())
 
         n.madd(
             "StorageUnit",
@@ -634,7 +782,7 @@ def attach_hydro(n, costs, ppl):
                 else 0.0
             ),
             marginal_cost=costs.at["hydro", "marginal_cost"],
-            p_max_pu=1.0,  # dispatch
+            p_max_pu=p_max_pu_df_filled,  # dispatch #fulmicotone
             p_min_pu=0.0,  # store
             efficiency_dispatch=costs.at["hydro", "efficiency"],
             efficiency_store=0.0,
