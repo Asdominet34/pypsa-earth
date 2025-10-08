@@ -515,6 +515,9 @@ rule add_electricity:
         electricity=config["electricity"],
         alternative_clustering=config["cluster_options"]["alternative_clustering"],
         renewable=config["renewable"],
+        q_min=config["renewable"]["hydro"]["GloFAS_ERA5"]["q_min"],
+        eff=config["renewable"]["hydro"]["GloFAS_ERA5"]["eff"],
+        hydro_methods=config["renewable"]["hydro"]["GloFAS_ERA5"]["methods"],
         length_factor=config["lines"]["length_factor"],
     input:
         **{

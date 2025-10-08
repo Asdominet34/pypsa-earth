@@ -1,0 +1,3 @@
+{
+    "plants": "         lon       lat countries  installed_hydro\n0   32.70470 -15.58590        MZ             True\n1   26.02130 -15.76010        ZM             True\n2   28.42160 -15.80670        ZM             True\n3   28.76210 -16.52250        ZM             True\n4   25.85980 -17.93050        ZM             True\n6   33.14500 -19.15570        MZ             True\n7   32.13417 -25.21854        MZ             True\n8   30.86490 -12.98840        ZM             True\n10  28.76190 -16.52220        ZW             True\n11  33.49300 -19.52600        MZ             True\n13  28.84228 -14.73887        ZM             True\n63  28.56010 -15.89590        ZM             True"
+}

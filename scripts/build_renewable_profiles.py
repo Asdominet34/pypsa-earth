@@ -481,6 +481,560 @@ def rescale_hydro(plants, runoff, normalize_using_yearly, normalization_year):
 
     return runoff
 
+import numpy as np
+import pandas as pd
+
+def add_qmax_turb(hydro_ppls, efficiency):
+    """
+    Adds the columns 'qmax_turb' and 'qmin_turb' to the hydro_ppls DataFrame,
+    based on dam height, installed capacity, and turbine efficiency.
+
+    Args:
+        hydro_ppls (pd.DataFrame): DataFrame containing at least the columns
+                                   'technology', 'damheight_m', and 'Capacity'.
+        efficiency (float): Turbine efficiency (default is 0.85).
+
+    Returns:
+        pd.DataFrame: The DataFrame with the new columns 'qmax_turb' and 'qmin_turb' added.
+    """
+    # Compute the median dam height for Run-of-River plants
+    hydro_ppls["technology"] = hydro_ppls["technology"].fillna("Run-Of-River")
+    run_of_river_plants = hydro_ppls[hydro_ppls['technology'] == 'Run-Of-River']
+    median_dam_height_ror = run_of_river_plants["damheight_m"].median(skipna=True)
+
+    # Compute the median dam height for Reservoir plants
+    reservoir_plants = hydro_ppls[hydro_ppls['technology'] == 'Reservoir']
+    median_dam_height_res = reservoir_plants["damheight_m"].median(skipna=True)
+
+    # Calculate maximum turbineable flow (qmax_turb)
+    hydro_ppls['qmax_turb'] = np.where(
+        hydro_ppls['damheight_m'].notna(),  # Use actual dam height if available
+        hydro_ppls['p_nom'] / (9.81 * hydro_ppls['damheight_m'] * 1e-3 * efficiency),
+        np.where(  # Otherwise, use median height by technology type
+            hydro_ppls['technology'] == 'Run-Of-River',
+            hydro_ppls['p_nom'] / (9.81 * median_dam_height_ror * 1e-3 * efficiency),
+            hydro_ppls['p_nom'] / (9.81 * median_dam_height_res * 1e-3 * efficiency)
+        )
+    )
+
+    # Calculate minimum turbineable flow as 20% of qmax
+    hydro_ppls['qmin_turb'] = hydro_ppls['qmax_turb'] * 0.2
+
+    return hydro_ppls
+
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from shapely.ops import unary_union
+from scipy.spatial import cKDTree
+
+def filter_valid_river_points(
+    river_ERA5LF, regions, threshold, all_hydro_ppls, grid_step=0.05, buffer_tolerance=0.5
+):
+    """
+    Filters ERA5 river points above a given threshold and matches them to hydropower plants.
+
+    Args:
+        river_ERA5LF (xr.DataArray): ERA5 river dataset with dimensions ('latitude', 'longitude').
+        regions (GeoDataFrame): Region boundaries (e.g. SAPP region).
+        threshold (float): Minimum river flow value in m³/s.
+        all_hydro_ppls (pd.DataFrame): DataFrame of hydropower plants with 'lat', 'lon', and 'qmax_turb'.
+        grid_step (float): Grid spacing used for distance search (default 0.05 degrees).
+        buffer_tolerance (float): Buffer around the regions for filtering points (default 0.5 degrees).
+
+    Returns:
+        not_found_plants (list): List of plant names not matched to any valid river point.
+        gdf_thresholded_coords (np.ndarray): Coordinates of valid ERA5 points above the threshold.
+    """
+
+    # Compute river mean over time
+    river_mean = river_ERA5LF.mean(dim="valid_time").fillna(0)
+
+    # Extract lat/lon coordinates
+    lat_vals = river_mean['latitude'].values
+    lon_vals = river_mean['longitude'].values
+
+    # Create meshgrid
+    longitude_coords, latitude_coords = np.meshgrid(lon_vals, lat_vals)
+
+    # Ensure dimensions match
+    river_values = river_mean.values
+    if river_values.shape != longitude_coords.shape:
+        raise ValueError(f"Inconsistent shapes: river_values={river_values.shape}, coords={longitude_coords.shape}")
+
+    # Flatten and clip negative/zero values
+    river_values = river_values.flatten()
+    river_values = np.where(river_values <= 0, 1e-10, river_values)
+
+    # Build DataFrame
+    df = pd.DataFrame({
+        "Longitude": longitude_coords.flatten(),
+        "Latitude": latitude_coords.flatten(),
+        "river Mean": river_values
+    })
+
+    # Percent of plants below threshold
+    num_plants_qmin_below_threshold = (all_hydro_ppls['qmax_turb'] < threshold).sum()
+    total_plants = len(all_hydro_ppls)
+    percentage_qmin_below_threshold = (num_plants_qmin_below_threshold / total_plants) * 100
+    print(f"Percentage of hydro_ppls with qmax_turb < threshold: {percentage_qmin_below_threshold:.2f}%")
+
+    external_boundary = unary_union(regions.geometry).buffer(buffer_tolerance)
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.Longitude, df.Latitude), crs="EPSG:4326")
+    gdf_extended_filtered = gdf[gdf.geometry.within(external_boundary)]
+
+    total_points_extended_region_filtered = len(gdf_extended_filtered)
+    print(f"Total number of initial points in the region: {total_points_extended_region_filtered}")
+
+    # Filter by flow threshold
+    gdf_thresholded = gdf_extended_filtered[gdf_extended_filtered["river Mean"] >= threshold]
+    total_points_thresholded = len(gdf_thresholded)
+    print(f"Total number of points in the region after threshold: {total_points_thresholded}")
+
+    # Prepare for distance matching
+    tolerance_factor = 1.2
+    max_distance = grid_step * np.sqrt(2) * tolerance_factor
+    gdf_thresholded_coords = gdf_thresholded[["Longitude", "Latitude"]].values
+    kdtree = cKDTree(gdf_thresholded_coords)
+
+    hydro_plant_coords = all_hydro_ppls[["lon", "lat"]].values
+    not_found_plants = []
+    for i, coord in enumerate(hydro_plant_coords):
+        distances, indices = kdtree.query(coord, distance_upper_bound=max_distance)
+        if np.isinf(distances):
+            not_found_plants.append(all_hydro_ppls.iloc[i]["name"])
+
+    num_not_found = len(not_found_plants)
+    percentage_not_found = (num_not_found / total_plants) * 100
+    print(f"Percentage of unmatched plants: {percentage_not_found:.2f}%")
+
+    return not_found_plants, gdf_thresholded
+
+def clustering_glofas(hydro_ppls, gdf_thresholded, not_found_plants, grid_step):
+    """
+    Cluster river points using DBSCAN and retain only clusters close to storage plants.
+
+    Parameters:
+        hydro_ppls (DataFrame): Hydropower plants with columns 'technology', 'Name', 'lon', 'lat'.
+        gdf_thresholded (GeoDataFrame): Filtered river points (thresholded).
+        not_found_plants (list): Plants not matched in earlier steps.
+        grid_step (float): Grid spacing used in distance grid.
+        tolerance_factor (float): Scaling factor for DBSCAN max_distance (default: 1.2).
+
+    Returns:
+        selected_clusters (GeoDataFrame): Points within selected clusters.
+        gdf_thresholded (GeoDataFrame): Same as input, with added cluster labels and flags.
+    """
+
+    # Step 0: Precompute coordinates and max_distance
+    gdf_thresholded_coords = gdf_thresholded[["Longitude", "Latitude"]].to_numpy()
+    tolerance_factor = 1.2
+    max_distance = grid_step * np.sqrt(2) * tolerance_factor
+
+    # Step 1: Cluster with DBSCAN
+    min_samples = 1
+    db = DBSCAN(eps=max_distance, min_samples=min_samples, metric="euclidean").fit(gdf_thresholded_coords)
+    gdf_thresholded["cluster"] = db.labels_
+
+    num_clusters = len(set(db.labels_)) - (1 if -1 in db.labels_ else 0)
+    print(f"Numero totale di cluster trovati: {num_clusters}")
+
+    gdf_thresholded["Cluster Category"] = gdf_thresholded["cluster"].apply(
+        lambda x: "Noise" if x == -1 else "Cluster"
+    )
+
+    # Step 2: Identify storage plants
+    plants_with_storage = hydro_ppls[
+        ~((hydro_ppls['technology'] == 'Run-Of-River') | 
+          (hydro_ppls['name'].isin(not_found_plants)))
+    ]
+    plants_with_storage_coords = plants_with_storage[["lon", "lat"]].to_numpy()
+
+    # Step 3: Helper to check if a plant is near a cluster
+    def is_near_cluster(plant_coords, cluster_coords, max_dist):
+        return np.any(np.linalg.norm(cluster_coords - plant_coords, axis=1) <= max_dist)
+
+    # Step 4: Identify relevant clusters
+    included_clusters = set()
+    clusters = gdf_thresholded.groupby("cluster")
+
+    for cluster_id, cluster_data in clusters:
+        if cluster_id == -1:
+            continue
+        cluster_coords = cluster_data[["Longitude", "Latitude"]].to_numpy()
+        for plant_coords in plants_with_storage_coords:
+            if is_near_cluster(plant_coords, cluster_coords, max_distance):
+                included_clusters.add(cluster_id)
+                break
+
+    print(f"Number of clusters included: {len(included_clusters)}")
+
+    gdf_thresholded["Cluster Selected"] = gdf_thresholded["cluster"].apply(
+        lambda x: "Selected" if x in included_clusters else "Discarded"
+    )
+    selected_clusters = gdf_thresholded[gdf_thresholded["Cluster Selected"] == "Selected"]
+
+    return selected_clusters, gdf_thresholded, plants_with_storage
+
+def segment_single_cluster(cluster_df, mean_tolerance, grid_step, tolerance_factor):
+    """
+    Segments a single river cluster into stream segments based on proximity and flow similarity.
+
+    Args:
+        cluster_df (DataFrame): Subset GeoDataFrame for a single cluster.
+        mean_tolerance (float): Allowed percentage difference in "river Mean" for grouping.
+        grid_step (float): Grid resolution in degrees.
+        tolerance_factor (float): Distance tolerance multiplier.
+
+    Returns:
+        DataFrame: Cluster with added "visited" and "segment" columns.
+    """
+    cluster_df = cluster_df.copy()
+    cluster_df["visited"] = False
+    cluster_df["segment"] = -1
+    segment_id = 0
+
+    eps = grid_step * np.sqrt(2) * tolerance_factor
+
+    def find_adjacent_points(point, cluster_df):
+        """Find unvisited neighboring points within distance `eps`."""
+        adjacent_points = cluster_df[
+            ~cluster_df["visited"] &
+            (
+                (np.sqrt((cluster_df["Longitude"] - point["Longitude"])**2 +
+                         (cluster_df["Latitude"] - point["Latitude"])**2) <= eps)
+            )
+        ]
+        return adjacent_points
+
+    cluster_df = cluster_df.sort_values(by="river Mean")
+
+    for idx, point in cluster_df.iterrows():
+        if cluster_df.at[idx, "visited"]:
+            continue
+
+        queue = [point]
+        cluster_df.at[idx, "visited"] = True
+        cluster_df.at[idx, "segment"] = segment_id
+
+        while queue:
+            current_point = queue.pop(0)
+            adjacent_points = find_adjacent_points(current_point, cluster_df)
+
+            for _, adj_point in adjacent_points.iterrows():
+                adj_idx = adj_point.name
+                if abs(adj_point["river Mean"] - current_point["river Mean"]) / current_point["river Mean"] <= mean_tolerance:
+                    cluster_df.at[adj_idx, "visited"] = True
+                    cluster_df.at[adj_idx, "segment"] = segment_id
+                    queue.append(adj_point)
+
+        segment_id += 1
+
+    return cluster_df
+
+def segment_all_clusters(gdf, mean_tolerance, grid_step, tolerance_factor):
+    """
+    Segments all clusters in a GeoDataFrame.
+
+    Args:
+        gdf (DataFrame): Input GeoDataFrame with clusters.
+        mean_tolerance (float): Allowed percentage difference in "river Mean".
+        grid_step (float): Grid resolution in degrees.
+        tolerance_factor (float): Distance tolerance multiplier.
+
+    Returns:
+        DataFrame: GeoDataFrame with "visited" and "segment" columns.
+    """
+    segmented_gdfs = []
+    unique_clusters = gdf["cluster"].unique()
+
+    for cluster_id in unique_clusters:
+        single_cluster = gdf[gdf["cluster"] == cluster_id]
+        segmented_cluster = segment_single_cluster(single_cluster, mean_tolerance, grid_step, tolerance_factor)
+        segmented_gdfs.append(segmented_cluster)
+
+    segmented_gdf = pd.concat(segmented_gdfs, ignore_index=True)
+    return segmented_gdf
+
+import numpy as np
+import pandas as pd
+
+def match_plants_to_segments(plants_with_storage, segmented_gdf, grid_step=0.05, tolerance_factor=1.2):
+    """
+    Match each storage hydropower plant to the best river segment point based on proximity and qmax similarity.
+
+    Parameters:
+        plants_with_storage (DataFrame): Plants with storage, must include ['Name', 'lon', 'lat', 'qmax_turb'].
+        segmented_gdf (GeoDataFrame): Segment points, must include ['Longitude', 'Latitude', 'river Mean', 'segment', 'cluster'].
+        grid_step (float): Spatial resolution of the original grid (in degrees). Default is 0.05.
+        tolerance_factor (float): Multiplicative factor to enlarge the matching radius. Default is 1.2.
+
+    Returns:
+        matched_df (DataFrame): Info on best matching segment for each plant.
+        filtered_segments (GeoDataFrame): Subset of segment points matched to plants.
+    """
+
+    # Compute max_distance from grid resolution and tolerance
+    max_distance = grid_step * np.sqrt(2) * tolerance_factor
+
+    matched_info = []
+    seg_coords = segmented_gdf[["Longitude", "Latitude"]].to_numpy()
+    plants_with_storage_coords = plants_with_storage[["lon", "lat"]].to_numpy()
+
+    for plant_idx, (lon, lat) in enumerate(plants_with_storage_coords):
+        plant_coord = np.array([lon, lat])
+        qmax = plants_with_storage.iloc[plant_idx]["qmax_turb"]
+
+        distances = np.linalg.norm(seg_coords - plant_coord, axis=1)
+        valid_idx = np.where(distances <= max_distance)[0]
+
+        if len(valid_idx) == 0:
+            continue  # Skip if no points within the radius
+
+        candidate_points = segmented_gdf.iloc[valid_idx].copy()
+        candidate_points["distance"] = distances[valid_idx]
+        candidate_points["diff_qmax"] = (candidate_points["river Mean"] - qmax).abs()
+        best_point = candidate_points.loc[candidate_points["diff_qmax"].idxmin()]
+
+        matched_info.append({
+            "plant_index": plant_idx,
+            "plant_name": plants_with_storage.iloc[plant_idx]["name"],
+            "segment": best_point["segment"],
+            "cluster": best_point["cluster"],
+            "matched_Lon": best_point["Longitude"],
+            "matched_Lat": best_point["Latitude"],
+            "distance": best_point["distance"],
+            "diff_qmax": best_point["diff_qmax"]
+        })
+
+    matched_df = pd.DataFrame(matched_info)
+
+    filtered_segments = segmented_gdf.merge(
+        matched_df[["segment", "cluster"]].drop_duplicates(), 
+        on=["segment", "cluster"]
+    )
+
+    return filtered_segments, matched_df
+
+def approximate_line_from_points(segment_df):
+    coords = segment_df[["Longitude", "Latitude"]].values
+    pca = PCA(n_components=1)
+    coords_1d = pca.fit_transform(coords).flatten()
+    min_proj_idx = coords_1d.argmin()
+    max_proj_idx = coords_1d.argmax()
+    start_candidate = segment_df.iloc[min_proj_idx]
+    end_candidate = segment_df.iloc[max_proj_idx]
+    start_is_min = start_candidate["river Mean"] <= end_candidate["river Mean"]
+    order = np.argsort(coords_1d)
+    if not start_is_min:
+        order = order[::-1]
+    ordered_indices = segment_df.iloc[order].index.tolist()
+    return ordered_indices
+
+def apply_segment_ordering(filtered_segments):
+    filtered_segments["order_in_segment"] = np.nan
+    grouped = filtered_segments.groupby(["cluster", "segment"])
+    for (cluster_id, segment_id), group in grouped:
+        ordered_idx = approximate_line_from_points(group)
+        for i, idx in enumerate(ordered_idx):
+            filtered_segments.at[idx, "order_in_segment"] = i
+    return filtered_segments
+
+def build_hourly_inflow_series(
+    matched_df,
+    order_filtered_segments,
+    river_era5LF,
+    hydro_ppls,
+    plants_with_storage,
+    not_found_plants,
+    year=2013,
+    grid_step=0.05,
+    tolerance_factor=1.2
+):
+    
+    # Step 1: Find best upstream points for storage plants
+    best_points_info = []
+    for _, match in matched_df.iterrows():
+        seg_id = match["segment"]
+        cluster_id = match["cluster"]
+        plant_name = match["plant_name"]
+        plant_idx = match["plant_index"]
+        matched_lat = match["matched_Lat"]
+        matched_lon = match["matched_Lon"]
+
+        plant_capacity = plants_with_storage.iloc[plant_idx]["p_nom"]
+        step_back = 5 if plant_capacity > 100 else 3
+
+        segment_df = order_filtered_segments[
+            (order_filtered_segments["segment"] == seg_id) &
+            (order_filtered_segments["cluster"] == cluster_id)
+        ]
+
+        coords_array = segment_df[["Longitude", "Latitude"]].to_numpy()
+        plant_coord = np.array([matched_lon, matched_lat])
+        distances = np.linalg.norm(coords_array - plant_coord, axis=1)
+        closest_idx = np.argmin(distances)
+        matched_point_order = segment_df.iloc[closest_idx]["order_in_segment"]
+        best_point_order = max(0, matched_point_order - step_back)
+        best_point_row = segment_df[segment_df["order_in_segment"] == best_point_order]
+
+        if not best_point_row.empty:
+            row = best_point_row.iloc[0]
+            best_points_info.append({
+                "plant_name": plant_name,
+                "segment": seg_id,
+                "cluster": cluster_id,
+                "matched_order": matched_point_order,
+                "best_Lon": row["Longitude"],
+                "best_Lat": row["Latitude"],
+                "best_order": best_point_order,
+                "capacity": plant_capacity
+            })
+
+    best_points_df = pd.DataFrame(best_points_info)
+
+    # Step 2: Extract time series
+    river_mean = river_era5LF.mean(dim="valid_time").fillna(0)
+    lon_values = river_era5LF['longitude'].values
+    lat_values = river_era5LF['latitude'].values
+    grid_coords = np.array(np.meshgrid(lon_values, lat_values)).T.reshape(-1, 2)
+    tree = cKDTree(grid_coords)
+
+    series_per_plant = []
+    combined_best_points = []
+
+    # RoR or not_found plants
+    plants_of_interest = hydro_ppls[
+        (hydro_ppls['technology'] == 'Run-Of-River') | 
+        (hydro_ppls['name'].isin(not_found_plants))
+    ]
+
+    max_distance = grid_step * np.sqrt(2) * tolerance_factor
+    weights = [0.5, 0.5]
+
+    for _, plant in plants_of_interest.iterrows():
+        plant_coord = np.array([plant['lon'], plant['lat']])
+        plant_name = plant['name']
+        qmax_turb = plant['qmax_turb']
+
+        distances, indices = tree.query(plant_coord, k=100, distance_upper_bound=max_distance)
+        valid_mask = np.isfinite(distances)
+        selected_points = grid_coords[indices[valid_mask]]
+
+        if len(selected_points) == 0:
+            continue
+
+        series_list = [
+            river_era5LF.sel(longitude=lon, latitude=lat, method="nearest").squeeze(drop=True)
+            for lon, lat in selected_points
+        ]
+
+        avg_values = [series.mean(dim="valid_time").values for series in series_list]
+        valid_indices = [i for i, val in enumerate(avg_values) if not np.isnan(val)]
+        if not valid_indices:
+            continue
+
+        filtered_indices = [i for i in valid_indices if avg_values[i] >= 0.2 * qmax_turb]
+        candidates = filtered_indices if filtered_indices else valid_indices
+
+        spatial_distances = distances[candidates]
+        river_differences = [abs(avg_values[i] - qmax_turb) for i in candidates]
+
+        spatial_distances_norm = spatial_distances / max(spatial_distances)
+        river_differences_norm = np.array(river_differences) / max(river_differences)
+        combined_scores = weights[0] * spatial_distances_norm + weights[1] * river_differences_norm
+
+        best_index = candidates[np.argmin(combined_scores)]
+        best_series = series_list[best_index]
+        best_point = selected_points[best_index]
+
+        best_series = best_series.drop_vars(['latitude', 'longitude'], errors='ignore')
+        best_series = best_series.assign_attrs(latitude=float(best_point[1]), longitude=float(best_point[0]))
+
+        series_per_plant.append(best_series)
+        combined_best_points.append({"plant_name": plant_name, "latitude": best_point[1], "longitude": best_point[0]})
+
+    # Storage plants
+    remaining_plants = hydro_ppls[
+        ~(hydro_ppls['technology'] == 'Run-Of-River') & 
+        ~(hydro_ppls['name'].isin(not_found_plants))
+    ]
+
+    for _, row in best_points_df.iterrows():
+        plant_name = row["plant_name"]
+        if plant_name not in remaining_plants["name"].values:
+            continue
+        lon = row["best_Lon"]
+        lat = row["best_Lat"]
+
+        series = river_era5LF.sel(longitude=lon, latitude=lat, method="nearest").squeeze(drop=True)
+        series = series.drop_vars(['latitude', 'longitude'], errors='ignore')
+        series = series.assign_attrs(latitude=float(lat), longitude=float(lon))
+
+        series_per_plant.append(series)
+        combined_best_points.append({"plant_name": plant_name, "latitude": lat, "longitude": lon})
+
+    series_dict = {bp["plant_name"]: series for bp, series in zip(combined_best_points, series_per_plant)}
+    ordered_names = hydro_ppls["name"].tolist()
+    ordered_series = [series_dict[name] for name in ordered_names if name in series_dict]
+
+    # Step 3: Concatenate and interpolate using DataFrame index
+    ordered_indices = [i for i in all_hydro_ppls.index if all_hydro_ppls.loc[i, "name"] in series_dict]
+    ordered_series = [series_dict[all_hydro_ppls.loc[i, "name"]] for i in ordered_indices]
+
+    inflow_Glofas = xr.concat(ordered_series, dim="plant")
+    inflow_Glofas = inflow_Glofas.assign_coords(plant=("plant", ordered_indices))
+    #inflow_Glofas.name = "river_series"
+    print(f"All series for plants appended.")
+
+    # Kariba fix
+    plants_to_modify = [7751, 7765]  # Gli ID delle due metà di Kariba
+    for plant_index in plants_to_modify:
+        if plant_index in inflow_Glofas.plant.values:
+            inflow_Glofas.loc[dict(plant=plant_index)] /= 2
+
+    # Shift timestamp to midday and interpolate hourly
+    inflow_Glofas = inflow_Glofas.assign_coords(
+        valid_time=(inflow_Glofas["valid_time"] - pd.Timedelta(days=1))
+    )
+    inflow_Glofas["valid_time"] = inflow_Glofas["valid_time"] + np.timedelta64(12, 'h')
+
+    start_time = np.datetime64(f"{year}-01-01T00:00:00")
+    end_time = np.datetime64(f"{year}-12-31T23:00:00")
+    time_index_hourly = pd.date_range(start=start_time, end=end_time, freq="H")
+
+    midday_times = inflow_Glofas.valid_time.values
+    daily_values = inflow_Glofas.values
+
+    expanded_values = []
+    for plant_idx in range(daily_values.shape[0]):
+        daily_series = pd.Series(daily_values[plant_idx], index=midday_times)
+        corrected_index = pd.date_range(start=start_time, periods=len(daily_series), freq="D")
+        corrected_series = pd.Series(daily_series.values, index=corrected_index)
+
+        extended_index = pd.DatetimeIndex([start_time]) \
+            .append(corrected_series.index) \
+            .append(pd.DatetimeIndex([end_time]))
+        extended_values = np.concatenate([
+            [corrected_series.iloc[0]],
+            corrected_series.values,
+            [corrected_series.iloc[-1]]
+        ])
+
+        extended_series = pd.Series(extended_values, index=extended_index).loc[~extended_index.duplicated()]
+        hourly_series = extended_series.reindex(time_index_hourly).interpolate(method='linear')
+        expanded_values.append(hourly_series.values)
+
+    expanded_values = np.array(expanded_values)
+
+    inflow_Glofas = xr.DataArray(
+        data=expanded_values,
+        dims=["plant", "time"],
+        coords={"plant": inflow_Glofas.plant.values, "time": time_index_hourly},
+        name="inflow_Glofas_h"
+    )
+
+    return inflow_Glofas
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -545,104 +1099,139 @@ if __name__ == "__main__":
         ppls = load_powerplants(snakemake.input.powerplants)
 
         all_hydro_ppls = ppls[ppls.carrier == "hydro"]
-
-        # select hydro units within hydrobasins
-        hgdf = gpd.GeoDataFrame(
-            all_hydro_ppls,
-            index=all_hydro_ppls.index,
-            geometry=gpd.points_from_xy(all_hydro_ppls.lon, all_hydro_ppls.lat),
-            crs=PPL_CRS,
-        ).to_crs(hydrobasins.crs)
-        temp_gdf = gpd.sjoin(hgdf, hydrobasins, predicate="within", how="left")
-
-        hydro_ppls = pd.DataFrame(
-            hgdf.loc[temp_gdf.index_right.dropna().index].drop(columns="geometry")
-        )
-
-        bus_notin_hydrobasins = list(
-            set(all_hydro_ppls.index).difference(set(hydro_ppls.index))
-        )
-
-        resource["plants"] = hydro_ppls.rename(columns={"country": "countries"})[
-            ["lon", "lat", "countries"]
-        ]
-
-        # TODO: possibly revise to account for non-existent hydro powerplants
-        resource["plants"]["installed_hydro"] = [
-            True for bus_id in resource["plants"].index
-        ]
-
-        # get normalization before executing runoff
-        normalization = None
-        if ("normalization" in config) and isinstance(config["normalization"], dict):
-            normalization = config.pop("normalization")
-
-        # check if there are hydro powerplants
-        if resource["plants"].empty:
-            # when no powerplants are available save an empty file
-            xr.DataArray(
-                dims=["plant", "time"], coords={"plant": []}, name="inflow"
-            ).to_netcdf(snakemake.output.profile)
+        print(all_hydro_ppls.columns)
+        
+        # get hydro profile calculation method
+        GloFAS_ERA5 = None
+        if "GloFAS_ERA5" in config:
+            if isinstance(config["GloFAS_ERA5"], dict):
+                GloFAS_ERA5 = config.pop("GloFAS_ERA5")
+                
+        methods = GloFAS_ERA5.get("methods")    
+        if methods == "GloFAS":
+                GloFAS_path = os.path.join(BASE_DIR, GloFAS_ERA5["GloFAS_ERA5_data"])
+                dataset_Glo = xr.open_dataset(GloFAS_path)
+                river_discharge_ERA5LF = dataset_Glo['dis24']
+                q_min_ror = GloFAS_ERA5["q_min"]
+                eff = GloFAS_ERA5["eff"]
+                inflow_threshold = GloFAS_ERA5["inflow_threshold"]
+                
+                print(f"GloFAS-ERA5 series extraction for hydro powerplants")
+                
+                all_hydro_ppls = add_qmax_turb(all_hydro_ppls, eff)
+                not_found_plants, gdf_thresholded = filter_valid_river_points(river_discharge_ERA5LF, regions, inflow_threshold, all_hydro_ppls, grid_step=0.05, buffer_tolerance=0.5)
+                selected_clusters, gdf_clustered, plants_with_storage = clustering_glofas(all_hydro_ppls, gdf_thresholded, not_found_plants, grid_step = 0.05)
+                print("cluster selected")
+                segmented_gdf = segment_all_clusters(selected_clusters, mean_tolerance=0.25, grid_step=0.05, tolerance_factor=1.2)
+                filtered_segments, matched_df = match_plants_to_segments(plants_with_storage, segmented_gdf, grid_step=0.05, tolerance_factor=1.2)
+                print("filtered segments")
+                order_filtered_segments = apply_segment_ordering(filtered_segments)
+                
+                inflow = build_hourly_inflow_series(matched_df, order_filtered_segments, river_discharge_ERA5LF, all_hydro_ppls, plants_with_storage, not_found_plants, year=2013, grid_step=0.05, tolerance_factor=1.2)
+                print(inflow)
         else:
-            # otherwise perform the calculations
-            inflow = correction_factor * func(capacity_factor=True, **resource)
+            # select hydro units within hydrobasins
+            hgdf = gpd.GeoDataFrame(
+                all_hydro_ppls,
+                index=all_hydro_ppls.index,
+                geometry=gpd.points_from_xy(all_hydro_ppls.lon, all_hydro_ppls.lat),
+                crs=PPL_CRS,
+            ).to_crs(hydrobasins.crs)
+            temp_gdf = gpd.sjoin(hgdf, hydrobasins, predicate="within", how="left")
 
-            if "clip_min_inflow" in config:
-                inflow = inflow.where(inflow >= config["clip_min_inflow"], 0)
+            hydro_ppls = pd.DataFrame(
+                hgdf.loc[temp_gdf.index_right.dropna().index].drop(columns="geometry")
+            )
 
-            # check if normalization field belongs to the settings and it is not false
-            if normalization:
-                method = normalization["method"]
-                norm_year = normalization.get("year", int(inflow.time[0].dt.year))
-                if method == "hydro_capacities":
-                    path_hydro_capacities = snakemake.input.hydro_capacities
-                    normalize_using_yearly = (
-                        get_hydro_capacities_annual_hydro_generation(
-                            path_hydro_capacities, countries, norm_year
-                        )
-                    )
+            bus_notin_hydrobasins = list(
+                set(all_hydro_ppls.index).difference(set(hydro_ppls.index))
+            )
 
-                elif method == "eia":
-                    path_eia_stats = snakemake.input.eia_hydro_generation
-                    normalize_using_yearly = get_eia_annual_hydro_generation(
-                        path_eia_stats, countries
-                    )
+            resource["plants"] = hydro_ppls.rename(columns={"country": "countries"})[
+                ["lon", "lat", "countries"]
+            ]
 
-                inflow = rescale_hydro(
-                    resource["plants"], inflow, normalize_using_yearly, norm_year
-                )
-                logger.info(
-                    f"Hydro normalization method '{method}' on year-statistics {norm_year}"
-                )
+            # TODO: possibly revise to account for non-existent hydro powerplants
+            resource["plants"]["installed_hydro"] = [
+                True for bus_id in resource["plants"].index
+            ]
+            
+            # get normalization before executing runoff
+            normalization = None
+            if ("normalization" in config) and isinstance(config["normalization"], dict):
+                normalization = config.pop("normalization")
+
+            # check if there are hydro powerplants
+            if resource["plants"].empty:
+                # when no powerplants are available save an empty file
+                xr.DataArray(
+                    dims=["plant", "time"], coords={"plant": []}, name="inflow"
+                ).to_netcdf(snakemake.output.profile)
             else:
-                logger.info("No hydro normalization")
+                # otherwise perform the calculations
+                inflow = correction_factor * func(capacity_factor=True, **resource)
+                
+                print("Contents of inflow:", inflow)
+                for plant_id in ['7751', '7765']:
+                    if plant_id in inflow.coords['plant']:
+                        inflow.loc[dict(plant=plant_id)] /= 2
 
-            inflow *= config.get("multiplier", 1.0)
+                if "clip_min_inflow" in config:
+                    inflow = inflow.where(inflow >= config["clip_min_inflow"], 0)
 
-            # add zero values for out of hydrobasins elements
-            if len(bus_notin_hydrobasins) > 0:
-                regions_notin = all_hydro_ppls.loc[
-                    bus_notin_hydrobasins, ["lon", "lat", "country"]
-                ]
-                logger.warning(
-                    f"Buses {bus_notin_hydrobasins} are not contained into hydrobasins."
-                    f"Setting empty time series. Bus location:\n{regions_notin}"
-                )
+                # check if normalization field belongs to the settings and it is not false
+                if normalization and normalization.get("method") not in [None, False]:
+                    method = normalization["method"]
+                    norm_year = normalization.get("year", int(inflow.time[0].dt.year))
+                    if method == "hydro_capacities":
+                        path_hydro_capacities = snakemake.input.hydro_capacities
+                        normalize_using_yearly = (
+                            get_hydro_capacities_annual_hydro_generation(
+                                path_hydro_capacities, countries, norm_year
+                            )
+                        )
 
-                # initialize empty DataArray and append to inflow
-                notin_data = xr.DataArray(
-                    np.zeros(
-                        (len(bus_notin_hydrobasins), inflow.coords["time"].shape[0])
-                    ),
-                    dims=("plant", "time"),
-                    coords=dict(
-                        plant=bus_notin_hydrobasins,
-                        time=inflow.coords["time"],
-                    ),
-                )
-                inflow = xr.concat([inflow, notin_data], dim="plant")
+                    elif method == "eia":
+                        path_eia_stats = snakemake.input.eia_hydro_generation
+                        normalize_using_yearly = get_eia_annual_hydro_generation(
+                            path_eia_stats, countries
+                        )
 
-            inflow.rename("inflow").to_netcdf(snakemake.output.profile)
+                    inflow = rescale_hydro(
+                        resource["plants"], inflow, normalize_using_yearly, norm_year
+                    )
+                    logger.info(
+                        f"Hydro normalization method '{method}' on year-statistics {norm_year}"
+                    )
+                else:
+                    logger.info("No hydro normalization")
+
+                inflow *= config.get("multiplier", 1.0)
+
+                # add zero values for out of hydrobasins elements
+                if len(bus_notin_hydrobasins) > 0:
+                    regions_notin = all_hydro_ppls.loc[
+                        bus_notin_hydrobasins, ["lon", "lat", "country"]
+                    ]
+                    logger.warning(
+                        f"Buses {bus_notin_hydrobasins} are not contained into hydrobasins."
+                        f"Setting empty time series. Bus location:\n{regions_notin}"
+                    )
+
+                    # initialize empty DataArray and append to inflow
+                    notin_data = xr.DataArray(
+                        np.zeros(
+                            (len(bus_notin_hydrobasins), inflow.coords["time"].shape[0])
+                        ),
+                        dims=("plant", "time"),
+                        coords=dict(
+                            plant=bus_notin_hydrobasins,
+                            time=inflow.coords["time"],
+                        ),
+                    )
+                    inflow = xr.concat([inflow, notin_data], dim="plant")
+
+        inflow.rename("inflow").to_netcdf(snakemake.output.profile)
     else:
         capacity_per_sqkm = config["capacity_per_sqkm"]
 
